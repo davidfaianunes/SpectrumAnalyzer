@@ -8,6 +8,9 @@
 
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#define NUM_CHANNELS 3
+#define BUFFER_CAPACITY 80000
+#define TEMPORARY_FALLBACK_SPEED 0.5 //FIXME
 
 //==============================================================================
 SpectrumAnalyzerAudioProcessor::SpectrumAnalyzerAudioProcessor()
@@ -22,10 +25,8 @@ SpectrumAnalyzerAudioProcessor::SpectrumAnalyzerAudioProcessor()
                        )
 #endif
 {
-    addParameter(nonePeakButtonState = new juce::AudioParameterBool("nonePeakButton", "None Peak", false));
-    addParameter(fastPeakButtonState = new juce::AudioParameterBool("fastPeakButton", "Fast Peak", false));
-    addParameter(mediumPeakButtonState = new juce::AudioParameterBool("mediumPeakButton", "Medium Peak", false));
-    addParameter(slowPeakButtonState = new juce::AudioParameterBool("slowPeakButton", "Slow Peak", false));
+    audioVisualizationProcessor = new AudioVisualizationProcessor(BUFFER_CAPACITY, NUM_CHANNELS);
+    sampleRate = 0;
 }
 
 SpectrumAnalyzerAudioProcessor::~SpectrumAnalyzerAudioProcessor()
@@ -95,16 +96,17 @@ void SpectrumAnalyzerAudioProcessor::changeProgramName (int index, const juce::S
 }
 
 //==============================================================================
-void SpectrumAnalyzerAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+void SpectrumAnalyzerAudioProcessor::prepareToPlay (double _sampleRate, int samplesPerBlock)
 {
-    // Use this method as the place to do any pre-playback
-    // initialisation that you need..
+    sampleRate = _sampleRate;
+    audioVisualizationProcessor->setSampleRate((int)_sampleRate);
+    lastSamples.resize(getTotalNumInputChannels(), 0.0f); // One state per channel
 }
 
 void SpectrumAnalyzerAudioProcessor::releaseResources()
 {
-    // When playback stops, you can use this as an opportunity to free up any
-    // spare memory, etc.
+    delete audioVisualizationProcessor;
+    audioVisualizationProcessor = nullptr;
 }
 
 #ifndef JucePlugin_PreferredChannelConfigurations
@@ -133,33 +135,56 @@ bool SpectrumAnalyzerAudioProcessor::isBusesLayoutSupported (const BusesLayout& 
 }
 #endif
 
-void SpectrumAnalyzerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
+void SpectrumAnalyzerAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
 {
     juce::ScopedNoDenormals noDenormals;
-    auto totalNumInputChannels  = getTotalNumInputChannels();
+    auto totalNumInputChannels = getTotalNumInputChannels();
     auto totalNumOutputChannels = getTotalNumOutputChannels();
 
-    // In case we have more outputs than inputs, this code clears any output
-    // channels that didn't contain input data, (because these aren't
-    // guaranteed to be empty - they may contain garbage).
-    // This is here to avoid people getting screaming feedback
-    // when they first compile a plugin, but obviously you don't need to keep
-    // this code if your algorithm always overwrites all the output channels.
-    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
-        buffer.clear (i, 0, buffer.getNumSamples());
+    blockSize = buffer.getNumSamples(); // Get the number of samples in the current block
 
-    // This is the place where you'd normally do the guts of your plugin's
-    // audio processing...
-    // Make sure to reset the state if your inner loop is processing
-    // the samples and the outer loop is handling the channels.
-    // Alternatively, you can process the samples with the channels
-    // interleaved by keeping the same state.
+    // Clear any extra output channels
+    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
+        buffer.clear(i, 0, blockSize);
+
+    // Allocate and sum data
+    float* summedData = new float[blockSize];
+    std::fill(summedData, summedData + blockSize, 0.0f);
+
     for (int channel = 0; channel < totalNumInputChannels; ++channel)
     {
-        auto* channelData = buffer.getWritePointer (channel);
+        const auto* channelData = buffer.getReadPointer(channel);
 
-        // ..do something to the data...
+        for (int sampleIndex = 0; sampleIndex < blockSize; ++sampleIndex)
+        {
+            summedData[sampleIndex] += channelData[sampleIndex];
+        }
     }
+
+    if (audioVisualizationProcessor != nullptr)
+    {
+        audioVisualizationProcessor->pushAudioData(summedData, blockSize, 0);
+    }
+
+    delete[] summedData;
+
+    // Apply the low-pass filter
+    for (int channel = 0; channel < totalNumInputChannels; ++channel)
+    {
+        auto* channelData = buffer.getWritePointer(channel);
+        applyLowpassFilter(channelData, blockSize, lowPassCutoffFrequency, sampleRate, channel);
+    }
+
+}
+
+
+juce::Path SpectrumAnalyzerAudioProcessor::getWaveformPath(int numSamples, int channel, int height, int width) {
+    return audioVisualizationProcessor->getVisualizationPath(numSamples, channel, height, width);
+}
+
+juce::Path SpectrumAnalyzerAudioProcessor::getSpectrumPath(double fallbackSpeed, int channel, int height, int width, int peakHoldMode, float lowPassFrequency) {
+    double numSamples = (double)sampleRate * fallbackSpeed;
+    return audioVisualizationProcessor->getSpectrumPath((int)numSamples, channel, height, width, peakHoldMode, lowPassFrequency);
 }
 
 //==============================================================================
@@ -192,4 +217,25 @@ void SpectrumAnalyzerAudioProcessor::setStateInformation (const void* data, int 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new SpectrumAnalyzerAudioProcessor();
+}
+
+void SpectrumAnalyzerAudioProcessor::applyLowpassFilter(float* data, int numSamples, float cutoffFrequency, double sampleRate, int channel)
+{
+    if (channel >= lastSamples.size() || sampleRate <= 0.0f) // Validate input
+        return;
+
+    float rc = 1.0f / (cutoffFrequency * 2.0f * juce::MathConstants<float>::pi);
+    float dt = 1.0f / static_cast<float>(sampleRate);
+    float alpha = dt / (rc + dt);
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        data[i] = alpha * data[i] + (1.0f - alpha) * lastSamples[channel];
+        lastSamples[channel] = data[i]; // Update the state
+    }
+}
+
+void SpectrumAnalyzerAudioProcessor::setLowPassFrequency(float frequency)
+{
+    lowPassCutoffFrequency = frequency;
 }

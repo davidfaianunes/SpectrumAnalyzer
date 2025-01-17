@@ -9,6 +9,8 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include "CircularBuffer.h"
+#include "AudioVisualizationProcessor.h"
 
 //==============================================================================
 /**
@@ -53,12 +55,21 @@ public:
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
-    juce::AudioParameterBool* nonePeakButtonState;
-    juce::AudioParameterBool* fastPeakButtonState;
-    juce::AudioParameterBool* mediumPeakButtonState;
-    juce::AudioParameterBool* slowPeakButtonState;
+    juce::Path getWaveformPath(int numSamples, int channel, int height, int width);
+    juce::Path getSpectrumPath(double fallbackSpeed, int channel, int height, int width, int peakHoldMode, float lowPassFrequency);
+
+    void setLowPassFrequency(float frequency);
 private:
     //==============================================================================
+
+    void SpectrumAnalyzerAudioProcessor::applyLowpassFilter(float* data, int numSamples, float cutoffFrequency, double sampleRate, int channel);
+    int sampleRate;
+    int blockSize;
+    AudioVisualizationProcessor* audioVisualizationProcessor;
+    bool theresNewDataSpectrum;
+    bool theresNewDataWave;
+    std::vector<float> lastSamples;
+    float lowPassCutoffFrequency;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SpectrumAnalyzerAudioProcessor)
 };
